@@ -4,6 +4,8 @@ import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import os
+import numpy as np # <<< Add numpy import
+import datetime # <<< Add datetime import
 
 # Güncellenmiş importlar
 from model import get_smp_model # <<< DEĞİŞİKLİK
@@ -15,13 +17,13 @@ LEARNING_RATE = 1e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 16
 NUM_EPOCHS = 150
-NUM_WORKERS = 4
+NUM_WORKERS = 0
 PIN_MEMORY = True
 LOAD_MODEL = False
-SAVE_DIR = "saved_models"
-MODEL_FILENAME = "kvasir_unet_resnet34_best.pth.tar" # <<< Model adı güncellendi
-MODEL_PATH = os.path.join(SAVE_DIR, MODEL_FILENAME)
-TENSORBOARD_LOG_DIR = "runs/kvasir_unet_resnet34" # <<< Log dizini güncellendi
+# --- Directory Settings (will be modified by timestamp) ---
+BASE_SAVE_DIR = "saved_models"
+BASE_LOG_DIR = "runs"
+MODEL_NAME_BASE = "kvasir_unet_resnet34"
 
 # --- SMP Model Ayarları ---
 ENCODER = 'resnet34' # Denenebilir: 'efficientnet-b0', 'mobilenet_v2' vb.
@@ -34,12 +36,15 @@ def train_one_epoch(loader, model, optimizer, loss_fn, scaler, writer, epoch):
     running_loss = 0.0
 
     for batch_idx, (data, targets) in enumerate(loop):
+        # DEBUG: Print type and shape of data and targets
+        #print("DEBUG data type:", type(data), "shape:", getattr(data, 'shape', None))
+        #print("DEBUG targets type:", type(targets), "shape:", getattr(targets, 'shape', None))
         data = data.to(device=DEVICE)
         # Targets zaten (N, 1, H, W) float formatında gelmeli (dataset.py'den)
         targets = targets.to(device=DEVICE)
 
         # Forward
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast(device_type=DEVICE): # <<< DEĞİŞİKLİK: device_type eklendi
             predictions = model(data) # Çıktı: (N, 1, H, W) logits
             loss = loss_fn(predictions, targets)
 
@@ -68,7 +73,7 @@ def validate_model(loader, model, loss_fn, writer, epoch):
             data = data.to(device=DEVICE)
             targets = targets.to(device=DEVICE) # (N, 1, H, W) float
 
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast(device_type=DEVICE): # <<< DEĞİŞİKLİK: device_type eklendi
                 predictions = model(data) # (N, 1, H, W) logits
                 loss = loss_fn(predictions, targets)
                 val_loss += loss.item()
@@ -102,10 +107,60 @@ def validate_model(loader, model, loss_fn, writer, epoch):
     print(f"Epoch {epoch+1} Validation Accuracy: {val_metrics['accuracy']:.4f}, IoU: {val_metrics['iou']:.4f}")
 
     model.train()
-    return avg_val_loss
+    # Return the entire metrics dictionary
+    return avg_val_loss, val_metrics # <<< Return metrics dict
 
+def find_best_threshold(model, loader, device):
+    """Find the best probability threshold based on validation set IoU."""
+    model.eval()
+    all_preds_raw, all_targets = [], []
+    print("\nFinding best threshold on validation set...")
+    with torch.no_grad():
+        for data, targets in tqdm(loader, desc="Threshold Search"):
+            data = data.to(device=device)
+            targets = targets.to(device=device)
+            with torch.amp.autocast(device_type=device):
+                predictions = model(data) # Logits
+            all_preds_raw.append(torch.sigmoid(predictions).cpu()) # Store probabilities
+            all_targets.append(targets.cpu())
+
+    all_preds_raw = torch.cat(all_preds_raw, dim=0)
+    all_targets = torch.cat(all_targets, dim=0).int()
+
+    best_iou = -1
+    best_threshold = 0.5 # Default
+    thresholds = np.arange(0.1, 0.9, 0.05) # Test thresholds from 0.1 to 0.85
+
+    for threshold in thresholds:
+        preds_binary = (all_preds_raw > threshold).int()
+        metrics = calculate_metrics(preds_binary, all_targets)
+        iou = metrics['iou']
+        print(f"  Threshold: {threshold:.2f}, IoU: {iou:.4f}")
+        if iou > best_iou:
+            best_iou = iou
+            best_threshold = threshold
+
+    print(f"Best threshold found: {best_threshold:.2f} with Validation IoU: {best_iou:.4f}")
+    model.train() # Set model back to train mode
+    return best_threshold
 
 def main():
+    # --- Create unique run directory based on timestamp ---
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"{MODEL_NAME_BASE}_{timestamp}"
+
+    # --- Define run-specific paths ---
+    TENSORBOARD_LOG_DIR = os.path.join(BASE_LOG_DIR, run_name)
+    SAVE_DIR = os.path.join(BASE_SAVE_DIR, run_name)
+    MODEL_FILENAME = f"{run_name}_best.pth.tar"
+    MODEL_PATH = os.path.join(SAVE_DIR, MODEL_FILENAME)
+
+    print(f"--- Starting Run: {run_name} ---")
+    print(f"TensorBoard Logs: {TENSORBOARD_LOG_DIR}")
+    print(f"Model Checkpoints: {SAVE_DIR}")
+    print(f"Best Model Path: {MODEL_PATH}")
+    # --- End of path setup ---
+
     # Modeli SMP kullanarak oluştur
     model = get_smp_model(
         encoder_name=ENCODER,
@@ -125,47 +180,69 @@ def main():
     train_loader, val_loader, _ = get_loaders(BATCH_SIZE, NUM_WORKERS, PIN_MEMORY)
 
     # Scaler
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler()
 
     # TensorBoard
-    os.makedirs(os.path.dirname(TENSORBOARD_LOG_DIR), exist_ok=True)
+    os.makedirs(TENSORBOARD_LOG_DIR, exist_ok=True) # <<< Use run-specific log dir
     writer = SummaryWriter(log_dir=TENSORBOARD_LOG_DIR)
 
     # Model yükleme
     start_epoch = 0
-    best_val_loss = float('inf')
-    if LOAD_MODEL and os.path.exists(MODEL_PATH):
-        # Önceden kaydedilmiş modeli ve en iyi loss değerini yükle
-        checkpoint = torch.load(MODEL_PATH, map_location=DEVICE) # map_location eklemek iyi olabilir
-        start_epoch, best_val_loss = load_checkpoint(checkpoint, model, optimizer)
-        print(f"Model loaded from {MODEL_PATH}. Resuming from epoch {start_epoch}. Best validation loss: {best_val_loss:.4f}")
+    best_val_loss = float('inf') # Still track loss for potential reference
+    best_val_iou = 0.0 # <<< Initialize best IoU
+    if LOAD_MODEL:
+        # NOTE: LOAD_MODEL logic might need adjustment if you want to resume
+        # a *specific* previous run. Currently assumes starting fresh.
+        print(f"Warning: LOAD_MODEL is True, but typically set to False for new timestamped runs.")
+        # Example: If you wanted to load, you'd need to specify the exact previous MODEL_PATH
+        # previous_model_path = "path/to/previous/run/model.pth.tar"
+        # if os.path.exists(previous_model_path):
+        #     checkpoint = torch.load(previous_model_path, map_location=DEVICE)
+        #     start_epoch, best_val_loss = load_checkpoint(checkpoint, model, optimizer)
+        # else:
+        #     print(f"Checkpoint for LOAD_MODEL not found at specified path.")
+        pass # Keep default start_epoch=0, best_val_loss=inf for now
     else:
-        print(f"Starting training from scratch or checkpoint not found at {MODEL_PATH}.")
-
+        print(f"Starting training from scratch for run {run_name}.")
 
     # Eğitim döngüsü
-    os.makedirs(SAVE_DIR, exist_ok=True) # Kayıt dizinini oluştur
+    os.makedirs(SAVE_DIR, exist_ok=True) # <<< Use run-specific save dir
     for epoch in range(start_epoch, NUM_EPOCHS):
         train_one_epoch(train_loader, model, optimizer, loss_fn, scaler, writer, epoch)
-        current_val_loss = validate_model(val_loader, model, loss_fn, writer, epoch)
+        # Get loss and metrics from validation
+        current_val_loss, current_val_metrics = validate_model(val_loader, model, loss_fn, writer, epoch) # <<< Get metrics dict
+        current_val_iou = current_val_metrics['iou'] # <<< Extract IoU
 
-        # En iyi modeli kaydet
-        if current_val_loss < best_val_loss:
-            print(f"Validation loss improved ({best_val_loss:.4f} --> {current_val_loss:.4f}). Saving model...")
-            best_val_loss = current_val_loss
+        # En iyi modeli IoU'ya göre kaydet
+        is_best = current_val_iou > best_val_iou # <<< Check IoU improvement
+        if is_best:
+            print(f"Validation IoU improved ({best_val_iou:.4f} --> {current_val_iou:.4f}). Saving model...")
+            best_val_iou = current_val_iou # <<< Update best IoU
             checkpoint = {
                 'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'best_val_loss': best_val_loss,
-                'encoder': ENCODER # Model bilgilerini kaydetmek iyi olabilir
+                'best_val_iou': best_val_iou, # <<< Save best IoU
+                'encoder': ENCODER
             }
             save_checkpoint(checkpoint, filename=MODEL_PATH)
 
     writer.close()
-    print("Training finished.")
-    print(f"Best validation loss achieved: {best_val_loss:.4f}")
+    print("\nTraining finished.")
+    # Print best IoU achieved
+    print(f"Best validation IoU achieved: {best_val_iou:.4f}")
     print(f"Best model saved to: {MODEL_PATH}")
+
+    # --- Find best threshold on validation set using the best model ---
+    print("\nLoading best model (based on IoU) for threshold tuning...")
+    if not os.path.exists(MODEL_PATH):
+        print(f"Error: Best model checkpoint not found at {MODEL_PATH}. Skipping threshold tuning.")
+        return
+    checkpoint = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
+    load_checkpoint(checkpoint, model) # Load best weights from this run
+    best_threshold = find_best_threshold(model, val_loader, DEVICE)
+    print(f"---> Use this threshold ({best_threshold:.2f}) in evaluate.py for test set evaluation.")
+    print(f"---> Remember to update MODEL_PATH in evaluate.py to: {MODEL_PATH}") # <<< Reminder
 
 if __name__ == "__main__":
     main()

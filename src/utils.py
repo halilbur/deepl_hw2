@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, jaccard_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, jaccard_score, confusion_matrix
 import torchvision # Görselleştirme için
 
 def save_checkpoint(state, filename="my_checkpoint.pth.tar"):
@@ -16,21 +16,32 @@ def load_checkpoint(checkpoint, model, optimizer=None):
 
 def calculate_metrics(preds, targets):
     """
-    Segmentasyon metriklerini hesaplar: Accuracy, Precision, Recall, F1, IoU.
+    Segmentasyon metriklerini hesaplar: Accuracy, Precision, Recall, F1, IoU, Confusion Matrix.
     preds: Model tahminleri (Sigmoid sonrası > 0.5 yapılmış, 0 veya 1 içeren tensor).
     targets: Gerçek maskeler (0 veya 1 içeren tensor).
     """
-    # CPU'ya alıp numpy'a çevir ve düzleştir
-    preds_flat = preds.cpu().numpy().flatten()
-    targets_flat = targets.cpu().numpy().flatten()
+    # Flatten tensors
+    preds_flat = preds.view(-1).cpu().numpy().astype(int) # Should already be 0/1
+    targets_flat = targets.view(-1).cpu().numpy().astype(bool).astype(int) # Ensure strictly 0/1
 
+    # Calculate metrics
     accuracy = accuracy_score(targets_flat, preds_flat)
     precision = precision_score(targets_flat, preds_flat, average='binary', zero_division=0)
     recall = recall_score(targets_flat, preds_flat, average='binary', zero_division=0)
     f1 = f1_score(targets_flat, preds_flat, average='binary', zero_division=0)
+    # IoU (Jaccard Score)
     iou = jaccard_score(targets_flat, preds_flat, average='binary', zero_division=0)
+    # Confusion Matrix
+    cm = confusion_matrix(targets_flat, preds_flat, labels=[0, 1]) # Ensure labels are 0 and 1
 
-    return {"accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1, "iou": iou}
+    return {
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "iou": iou,
+        "confusion_matrix": cm
+    }
 
 def log_images_to_tensorboard(writer, images, targets, preds, epoch, phase='Validation'):
     """
