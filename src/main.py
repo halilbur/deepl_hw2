@@ -14,7 +14,7 @@ if __name__ == "__main__":
     print(f"Selected Mode: {args.mode}")
     print("="*30)
     print("Dataset: KvasirMSBench")
-    print("Model: SMP U-Net (veya benzeri)")
+    print("Model: CustomUNet")
     print("Input Size: 256x256")
     print("="*30)
 

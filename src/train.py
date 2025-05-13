@@ -6,16 +6,18 @@ from tqdm import tqdm
 import os
 import numpy as np # <<< Add numpy import
 import datetime # <<< Add datetime import
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
 
 # Güncellenmiş importlar
-from model import get_smp_model # <<< DEĞİŞİKLİK
+from model import CustomUNet # <<< DEĞİŞİKLİK
 from dataset import get_loaders
-from utils import save_checkpoint, load_checkpoint, calculate_metrics, log_images_to_tensorboard
+from utils import save_checkpoint, load_checkpoint, calculate_metrics, log_images_to_tensorboard, DiceLoss
 
 # --- Hiperparametreler ---
 LEARNING_RATE = 1e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE = 16
+BATCH_SIZE = 8
 NUM_EPOCHS = 150
 NUM_WORKERS = 0
 PIN_MEMORY = True
@@ -23,226 +25,217 @@ LOAD_MODEL = False
 # --- Directory Settings (will be modified by timestamp) ---
 BASE_SAVE_DIR = "saved_models"
 BASE_LOG_DIR = "runs"
-MODEL_NAME_BASE = "kvasir_unet_resnet34"
+MODEL_NAME_BASE = "kvasir_custom_unet_bce_dice_bs8" # Updated model name
 
-# --- SMP Model Ayarları ---
-ENCODER = 'resnet34' # Denenebilir: 'efficientnet-b0', 'mobilenet_v2' vb.
-ENCODER_WEIGHTS = 'imagenet'
-
-def train_one_epoch(loader, model, optimizer, loss_fn, scaler, writer, epoch):
-    """Bir epoch için eğitim adımı."""
-    loop = tqdm(loader, leave=True)
-    model.train()
+# --- train_one_epoch function ---
+def train_one_epoch(loader, model, optimizer, bce_loss_fn, dice_loss_fn, loss_alpha, loss_beta, scaler, writer, epoch): # Added loss_alpha, loss_beta
+    loop = tqdm(loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Training]")
     running_loss = 0.0
+    running_bce_loss = 0.0 # Optional: for logging
+    running_dice_loss = 0.0 # Optional: for logging
+
+    model.train() # Ensure model is in training mode
 
     for batch_idx, (data, targets) in enumerate(loop):
-        # DEBUG: Print type and shape of data and targets
-        #print("DEBUG data type:", type(data), "shape:", getattr(data, 'shape', None))
-        #print("DEBUG targets type:", type(targets), "shape:", getattr(targets, 'shape', None))
         data = data.to(device=DEVICE)
-        # Targets zaten (N, 1, H, W) float formatında gelmeli (dataset.py'den)
         targets = targets.to(device=DEVICE)
 
         # Forward
-        with torch.amp.autocast(device_type=DEVICE): # <<< DEĞİŞİKLİK: device_type eklendi
-            predictions = model(data) # Çıktı: (N, 1, H, W) logits
-            loss = loss_fn(predictions, targets)
+        with torch.amp.autocast(device_type=DEVICE):
+            predictions = model(data) # These are raw logits
+            
+            # Calculate individual losses
+            loss_b = bce_loss_fn(predictions, targets)
+            loss_d = dice_loss_fn(predictions, targets)
+            
+            # Combine losses
+            # You can choose weights, e.g., alpha=0.5, beta=0.5 or alpha=1.0, beta=1.0
+            combined_loss = (loss_alpha * loss_b) + (loss_beta * loss_d)
 
         # Backward
         optimizer.zero_grad()
-        scaler.scale(loss).backward()
+        scaler.scale(combined_loss).backward()
+        # Optional: Gradient Clipping (from previous suggestion, if needed)
+        # scaler.unscale_(optimizer)
+        # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
 
-        running_loss += loss.item()
-        loop.set_description(f"Epoch [{epoch+1}/{NUM_EPOCHS}]")
-        loop.set_postfix(loss=loss.item())
+        running_loss += combined_loss.item()
+        running_bce_loss += loss_b.item() # Optional
+        running_dice_loss += loss_d.item() # Optional
+        loop.set_postfix(loss=combined_loss.item(), bce=loss_b.item(), dice=loss_d.item())
 
     avg_loss = running_loss / len(loader)
-    writer.add_scalar("Loss/train", avg_loss, epoch)
-    print(f"Epoch {epoch+1} Train Loss: {avg_loss:.4f}")
+    avg_bce_loss = running_bce_loss / len(loader) # Optional
+    avg_dice_loss = running_dice_loss / len(loader) # Optional
 
-def validate_model(loader, model, loss_fn, writer, epoch):
-    """Validasyon verisi üzerinde modeli değerlendirir."""
+    writer.add_scalar("Loss/train_combined", avg_loss, epoch)
+    writer.add_scalar("Loss/train_bce", avg_bce_loss, epoch) # Optional
+    writer.add_scalar("Loss/train_dice", avg_dice_loss, epoch) # Optional
+    print(f"Epoch {epoch+1} - Training Combined Loss: {avg_loss:.4f} (BCE: {avg_bce_loss:.4f}, Dice: {avg_dice_loss:.4f})")
+    return avg_loss
+
+# --- validate_model function ---
+def validate_model(loader, model, bce_loss_fn, dice_loss_fn, loss_alpha, loss_beta, writer, epoch): # Added loss_alpha, loss_beta
     model.eval()
-    val_loss = 0.0
-    all_preds, all_targets = [], []
+    running_val_loss = 0.0
+    running_val_bce_loss = 0.0 # Optional
+    running_val_dice_loss = 0.0 # Optional
+    all_preds_raw_list = []
+    all_targets_list = []
 
+    loop = tqdm(loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Validation]", leave=False)
     with torch.no_grad():
-        for batch_idx, (data, targets) in enumerate(loader):
+        for data, targets in loop:
             data = data.to(device=DEVICE)
-            targets = targets.to(device=DEVICE) # (N, 1, H, W) float
+            targets = targets.to(device=DEVICE)
 
-            with torch.amp.autocast(device_type=DEVICE): # <<< DEĞİŞİKLİK: device_type eklendi
-                predictions = model(data) # (N, 1, H, W) logits
-                loss = loss_fn(predictions, targets)
-                val_loss += loss.item()
+            with torch.amp.autocast(device_type=DEVICE):
+                predictions_raw = model(data) # Raw logits
+                
+                loss_b_val = bce_loss_fn(predictions_raw, targets)
+                loss_d_val = dice_loss_fn(predictions_raw, targets)
+                combined_loss_val = (loss_alpha * loss_b_val) + (loss_beta * loss_d_val)
+            
+            running_val_loss += combined_loss_val.item()
+            running_val_bce_loss += loss_b_val.item() # Optional
+            running_val_dice_loss += loss_d_val.item() # Optional
 
-            # Metrik hesaplaması için tahminleri işleyip topla
-            preds_processed = (torch.sigmoid(predictions) > 0.5).int() # (N, 1, H, W) binary (0/1)
+            all_preds_raw_list.append(torch.sigmoid(predictions_raw).cpu())
+            all_targets_list.append(targets.cpu())
+            loop.set_postfix(val_loss=combined_loss_val.item())
 
-            all_preds.append(preds_processed.cpu())
-            all_targets.append(targets.cpu()) # Hedefler zaten uygun formatta
+    avg_val_loss = running_val_loss / len(loader)
+    avg_val_bce_loss = running_val_bce_loss / len(loader) # Optional
+    avg_val_dice_loss = running_val_dice_loss / len(loader) # Optional
+    
+    writer.add_scalar("Loss/validation_combined", avg_val_loss, epoch)
+    writer.add_scalar("Loss/validation_bce", avg_val_bce_loss, epoch) # Optional
+    writer.add_scalar("Loss/validation_dice", avg_val_dice_loss, epoch) # Optional
 
-            # İlk batch için görüntüleri TensorBoard'a logla
-            if batch_idx == 0:
-                log_images_to_tensorboard(writer, data, targets, predictions, epoch, phase='Validation') # <<< utils'deki fonksiyonu çağırır
+    all_preds_raw = torch.cat(all_preds_raw_list)
+    all_targets = torch.cat(all_targets_list)
 
-    avg_val_loss = val_loss / len(loader)
+    best_iou_for_epoch = -1
+    optimal_threshold_for_epoch = 0.5 
+    thresholds_to_test = np.arange(0.1, 0.9, 0.05)
 
-    # Metrikleri hesapla
-    all_preds = torch.cat(all_preds, dim=0)
-    all_targets = torch.cat(all_targets, dim=0).int() # Metrik fonksiyonu int bekleyebilir
-    val_metrics = calculate_metrics(all_preds, all_targets)
+    for th in thresholds_to_test:
+        preds_binary = (all_preds_raw > th).int()
+        metrics_at_th = calculate_metrics(preds_binary, all_targets)
+        iou_at_th = metrics_at_th['iou']
+        if iou_at_th > best_iou_for_epoch:
+            best_iou_for_epoch = iou_at_th
+            optimal_threshold_for_epoch = th
+            
+    final_preds_binary = (all_preds_raw > optimal_threshold_for_epoch).int()
+    final_metrics = calculate_metrics(final_preds_binary, all_targets)
 
-    # TensorBoard logları
-    writer.add_scalar("Loss/validation", avg_val_loss, epoch)
-    writer.add_scalar("Accuracy/validation", val_metrics["accuracy"], epoch)
-    writer.add_scalar("Precision/validation", val_metrics["precision"], epoch)
-    writer.add_scalar("Recall/validation", val_metrics["recall"], epoch)
-    writer.add_scalar("F1-Score/validation", val_metrics["f1"], epoch)
-    writer.add_scalar("IoU/validation", val_metrics["iou"], epoch)
+    print(f"Epoch {epoch+1} - Validation Combined Loss: {avg_val_loss:.4f} (BCE: {avg_val_bce_loss:.4f}, Dice: {avg_val_dice_loss:.4f}), Val IoU (at th={optimal_threshold_for_epoch:.2f}): {final_metrics['iou']:.4f}")
+    return avg_val_loss, final_metrics, optimal_threshold_for_epoch
 
-    print(f"Epoch {epoch+1} Validation Loss: {avg_val_loss:.4f}")
-    print(f"Epoch {epoch+1} Validation Accuracy: {val_metrics['accuracy']:.4f}, IoU: {val_metrics['iou']:.4f}")
 
-    model.train()
-    # Return the entire metrics dictionary
-    return avg_val_loss, val_metrics # <<< Return metrics dict
-
-def find_best_threshold(model, loader, device):
-    """Find the best probability threshold based on validation set IoU."""
-    model.eval()
-    all_preds_raw, all_targets = [], []
-    print("\nFinding best threshold on validation set...")
-    with torch.no_grad():
-        for data, targets in tqdm(loader, desc="Threshold Search"):
-            data = data.to(device=device)
-            targets = targets.to(device=device)
-            with torch.amp.autocast(device_type=device):
-                predictions = model(data) # Logits
-            all_preds_raw.append(torch.sigmoid(predictions).cpu()) # Store probabilities
-            all_targets.append(targets.cpu())
-
-    all_preds_raw = torch.cat(all_preds_raw, dim=0)
-    all_targets = torch.cat(all_targets, dim=0).int()
-
-    best_iou = -1
-    best_threshold = 0.5 # Default
-    thresholds = np.arange(0.1, 0.9, 0.05) # Test thresholds from 0.1 to 0.85
-
-    for threshold in thresholds:
-        preds_binary = (all_preds_raw > threshold).int()
-        metrics = calculate_metrics(preds_binary, all_targets)
-        iou = metrics['iou']
-        print(f"  Threshold: {threshold:.2f}, IoU: {iou:.4f}")
-        if iou > best_iou:
-            best_iou = iou
-            best_threshold = threshold
-
-    print(f"Best threshold found: {best_threshold:.2f} with Validation IoU: {best_iou:.4f}")
-    model.train() # Set model back to train mode
-    return best_threshold
 
 def main():
-    # --- Create unique run directory based on timestamp ---
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"{MODEL_NAME_BASE}_{timestamp}"
 
-    # --- Define run-specific paths ---
-    TENSORBOARD_LOG_DIR = os.path.join(BASE_LOG_DIR, run_name)
-    SAVE_DIR = os.path.join(BASE_SAVE_DIR, run_name)
+    LOSS_ALPHA_BCE = 0.5  # Weight for BCE Loss
+    LOSS_BETA_DICE = 0.5  # Weight for Dice Loss
+
+    global LOAD_MODEL # <<< Add this line
+    global DEVICE # <<< Add this line
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"{MODEL_NAME_BASE}_{timestamp}" # Use the updated MODEL_NAME_BASE
+
+    # ... (rest of your path setup as before) ...
+    TENSORBOARD_LOG_DIR = os.path.join("runs", run_name) # Assuming BASE_LOG_DIR is "runs"
+    SAVE_DIR = os.path.join("saved_models", run_name) # Assuming BASE_SAVE_DIR is "saved_models"
     MODEL_FILENAME = f"{run_name}_best.pth.tar"
     MODEL_PATH = os.path.join(SAVE_DIR, MODEL_FILENAME)
 
-    print(f"--- Starting Run: {run_name} ---")
-    print(f"TensorBoard Logs: {TENSORBOARD_LOG_DIR}")
-    print(f"Model Checkpoints: {SAVE_DIR}")
-    print(f"Best Model Path: {MODEL_PATH}")
-    # --- End of path setup ---
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    os.makedirs(TENSORBOARD_LOG_DIR, exist_ok=True)
+    
+    print(f"--- Starting Run: {run_name} with Combined BCE+Dice Loss (alpha={LOSS_ALPHA_BCE}, beta={LOSS_BETA_DICE}) ---")
+    # ... (print other paths) ...
 
-    # Modeli SMP kullanarak oluştur
-    model = get_smp_model(
-        encoder_name=ENCODER,
-        encoder_weights=ENCODER_WEIGHTS,
-        in_channels=3, # <<< KvasirMSBench için 3 kanal
-        classes=1,     # <<< Binary segmentasyon için 1 sınıf
-        activation=None # <<< BCEWithLogitsLoss kullanacağımız için aktivasyon yok
-    ).to(DEVICE)
+    model = CustomUNet(in_channels=3, num_classes=1).to(DEVICE)
+    # ... (print model params) ...
 
-    # Loss fonksiyonu (Binary Cross Entropy with Logits)
-    loss_fn = nn.BCEWithLogitsLoss()
+    # Instantiate individual loss functions
+    bce_loss_fn = nn.BCEWithLogitsLoss()
+    dice_loss_fn = DiceLoss().to(DEVICE) # Make sure DiceLoss is on the correct device
 
-    # Optimizasyon algoritması
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    
+    # Learning Rate Scheduler (from previous step)
+    scheduler = ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.1, patience=5, verbose=True
+    )
 
-    # DataLoader'lar
+    # ... (DataLoaders, GradScaler, TensorBoard Writer, LOAD_MODEL logic as before) ...
     train_loader, val_loader, _ = get_loaders(BATCH_SIZE, NUM_WORKERS, PIN_MEMORY)
-
-    # Scaler
     scaler = torch.amp.GradScaler()
-
-    # TensorBoard
-    os.makedirs(TENSORBOARD_LOG_DIR, exist_ok=True) # <<< Use run-specific log dir
     writer = SummaryWriter(log_dir=TENSORBOARD_LOG_DIR)
-
-    # Model yükleme
     start_epoch = 0
-    best_val_loss = float('inf') # Still track loss for potential reference
-    best_val_iou = 0.0 # <<< Initialize best IoU
-    if LOAD_MODEL:
-        # NOTE: LOAD_MODEL logic might need adjustment if you want to resume
-        # a *specific* previous run. Currently assumes starting fresh.
-        print(f"Warning: LOAD_MODEL is True, but typically set to False for new timestamped runs.")
-        # Example: If you wanted to load, you'd need to specify the exact previous MODEL_PATH
-        # previous_model_path = "path/to/previous/run/model.pth.tar"
-        # if os.path.exists(previous_model_path):
-        #     checkpoint = torch.load(previous_model_path, map_location=DEVICE)
-        #     start_epoch, best_val_loss = load_checkpoint(checkpoint, model, optimizer)
-        # else:
-        #     print(f"Checkpoint for LOAD_MODEL not found at specified path.")
-        pass # Keep default start_epoch=0, best_val_loss=inf for now
-    else:
-        print(f"Starting training from scratch for run {run_name}.")
+    best_val_iou = 0.0
+    # Add LOAD_MODEL logic here if needed, similar to previous versions
 
-    # Eğitim döngüsü
-    os.makedirs(SAVE_DIR, exist_ok=True) # <<< Use run-specific save dir
     for epoch in range(start_epoch, NUM_EPOCHS):
-        train_one_epoch(train_loader, model, optimizer, loss_fn, scaler, writer, epoch)
-        # Get loss and metrics from validation
-        current_val_loss, current_val_metrics = validate_model(val_loader, model, loss_fn, writer, epoch) # <<< Get metrics dict
-        current_val_iou = current_val_metrics['iou'] # <<< Extract IoU
+        # Pass individual loss functions and their weights to train_one_epoch
+        train_loss_combined = train_one_epoch(
+            train_loader, model, optimizer, 
+            bce_loss_fn, dice_loss_fn, LOSS_ALPHA_BCE, LOSS_BETA_DICE, # Pass losses and weights
+            scaler, writer, epoch
+        )
+        
+        # Pass individual loss functions and their weights to validate_model
+        val_loss_combined, val_metrics, optimal_threshold = validate_model(
+            val_loader, model, 
+            bce_loss_fn, dice_loss_fn, LOSS_ALPHA_BCE, LOSS_BETA_DICE, # Pass losses and weights
+            writer, epoch
+        )
+        current_val_iou = val_metrics['iou']
 
-        # En iyi modeli IoU'ya göre kaydet
-        is_best = current_val_iou > best_val_iou # <<< Check IoU improvement
+        # LR Scheduler step
+        scheduler.step(current_val_iou) # Monitor validation IoU
+
+        writer.add_scalar("LearningRate", optimizer.param_groups[0]['lr'], epoch) # Log learning rate
+        # ... (log other validation metrics as before: IoU, Dice, Acc) ...
+        writer.add_scalar("IoU/validation", current_val_iou, epoch)
+        writer.add_scalar("Dice/validation", val_metrics['dice'], epoch)
+        writer.add_scalar("Accuracy/validation", val_metrics['accuracy'], epoch)
+        writer.add_scalar("Optimal_Threshold/validation", optimal_threshold, epoch)
+
+
+        print(f"Epoch {epoch+1} Summary: Train Combined Loss: {train_loss_combined:.4f}, Val Combined Loss: {val_loss_combined:.4f}, Val IoU: {current_val_iou:.4f} (Optimal Th: {optimal_threshold:.2f})")
+
+        is_best = current_val_iou > best_val_iou
         if is_best:
-            print(f"Validation IoU improved ({best_val_iou:.4f} --> {current_val_iou:.4f}). Saving model...")
-            best_val_iou = current_val_iou # <<< Update best IoU
-            checkpoint = {
-                'epoch': epoch + 1,
+            best_val_iou = current_val_iou
+            # ... (save checkpoint logic as before, ensure 'optimal_threshold' is saved) ...
+            print(f"New best validation IoU: {best_val_iou:.4f}. Saving model to {MODEL_PATH}")
+            checkpoint_data = {
+                'epoch': epoch,
                 'state_dict': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'best_val_iou': best_val_iou, # <<< Save best IoU
-                'encoder': ENCODER
+                'best_val_iou': best_val_iou,
+                'best_val_loss': val_loss_combined, # Save combined val loss
+                'optimal_threshold': optimal_threshold
             }
-            save_checkpoint(checkpoint, filename=MODEL_PATH)
+            save_checkpoint(checkpoint_data, filename=MODEL_PATH)
+
+        # ... (log images to TensorBoard as before) ...
+        if epoch % 10 == 0 or epoch == NUM_EPOCHS - 1:
+            log_images_to_tensorboard(val_loader, model, writer, epoch, device=DEVICE, num_images=5, threshold=optimal_threshold)
+
 
     writer.close()
-    print("\nTraining finished.")
-    # Print best IoU achieved
-    print(f"Best validation IoU achieved: {best_val_iou:.4f}")
-    print(f"Best model saved to: {MODEL_PATH}")
+    # ... (print final summary) ...
+    print(f"--- Run {run_name} Finished ---")
+    print(f"Best Validation IoU achieved: {best_val_iou:.4f}")
+    print(f"Best model and logs saved in directory: {SAVE_DIR} and {TENSORBOARD_LOG_DIR}")
 
-    # --- Find best threshold on validation set using the best model ---
-    print("\nLoading best model (based on IoU) for threshold tuning...")
-    if not os.path.exists(MODEL_PATH):
-        print(f"Error: Best model checkpoint not found at {MODEL_PATH}. Skipping threshold tuning.")
-        return
-    checkpoint = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
-    load_checkpoint(checkpoint, model) # Load best weights from this run
-    best_threshold = find_best_threshold(model, val_loader, DEVICE)
-    print(f"---> Use this threshold ({best_threshold:.2f}) in evaluate.py for test set evaluation.")
-    print(f"---> Remember to update MODEL_PATH in evaluate.py to: {MODEL_PATH}") # <<< Reminder
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
