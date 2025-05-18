@@ -1,8 +1,75 @@
 import torch
 import numpy as np
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, jaccard_score, confusion_matrix
-import torchvision # Görselleştirme için
+import torchvision
 import torch.nn as nn
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+from PIL import Image, ImageDraw, ImageFont
+import os
+
+def save_confusion_matrix_image(cm, path, filename="confusion_matrix.png", class_names=None):
+    if class_names is None:
+        class_names = ['Background', 'Polyp'] # For binary case
+    
+    df_cm = pd.DataFrame(cm, index=class_names, columns=class_names)
+    plt.figure(figsize=(8, 6))
+    try:
+        sns.heatmap(df_cm, annot=True, fmt="d", cmap="Blues") # fmt="d" for integer counts
+        plt.title("Confusion Matrix")
+        plt.ylabel("Actual")
+        plt.xlabel("Predicted")
+        plt.savefig(os.path.join(path, filename))
+        plt.close()
+        print(f"Confusion matrix saved to {os.path.join(path, filename)}")
+    except Exception as e:
+        print(f"Could not save confusion matrix: {e}")
+
+def save_evaluation_images(original_img_tensor, pred_mask_tensor, target_mask_tensor, img_idx, results_dir):
+    """Saves original, predicted mask, and target mask for a single sample."""
+    original_pil = torchvision.transforms.ToPILImage()(denormalize(original_img_tensor.cpu())[0])
+    pred_pil = torchvision.transforms.ToPILImage()(pred_mask_tensor[0].float().cpu()) # Ensure mask is float (0 or 1)
+    target_pil = torchvision.transforms.ToPILImage()(target_mask_tensor[0].float().cpu())
+
+
+
+    # Create a combined image
+    width, height = original_pil.size
+    combined_img = Image.new('RGB', (width * 3, height + 30)) # +30 for titles
+    
+    # Add titles
+    try:
+        font = ImageFont.truetype("arial.ttf", 15) # Adjust font if needed
+    except IOError:
+        font = ImageFont.load_default()
+    draw = ImageDraw.Draw(combined_img)
+    draw.text((10, 5), "Original Image", fill="white", font=font)
+    draw.text((width + 10, 5), "Predicted Mask", fill="white", font=font)
+    draw.text((width * 2 + 10, 5), "Target Mask", fill="white", font=font)
+
+    combined_img.paste(original_pil, (0, 30))
+    combined_img.paste(pred_pil.convert('RGB'), (width, 30)) # Convert mask to RGB for pasting
+    combined_img.paste(target_pil.convert('RGB'), (width * 2, 30))
+    
+    combined_filename = f"eval_sample_{img_idx}.png"
+    if not os.path.exists(results_dir):
+        os.makedirs(results_dir)
+        print(f"Created results directory: {results_dir}")
+    combined_img.save(os.path.join(results_dir, combined_filename))
+
+
+def denormalize(tensor, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
+    # Assuming tensor is (C, H, W) or (N, C, H, W)
+    # This is a common ImageNet denormalization
+    if tensor.ndim == 3:
+        for t, m, s in zip(tensor, mean, std):
+            t.mul_(s).add_(m)
+    elif tensor.ndim == 4:
+        for i in range(tensor.size(0)):
+            for t, m, s in zip(tensor[i], mean, std):
+                t.mul_(s).add_(m)
+    return torch.clamp(tensor, 0, 1)
 
 def save_checkpoint(state, filename="my_checkpoint.pth.tar"):
     print("=> Saving checkpoint")

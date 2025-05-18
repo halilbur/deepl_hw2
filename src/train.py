@@ -17,7 +17,7 @@ from utils import save_checkpoint, load_checkpoint, calculate_metrics, log_image
 # --- Hiperparametreler ---
 LEARNING_RATE = 1e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE = 8
+BATCH_SIZE = 32
 NUM_EPOCHS = 150
 NUM_WORKERS = 0
 PIN_MEMORY = True
@@ -25,7 +25,7 @@ LOAD_MODEL = False
 # --- Directory Settings (will be modified by timestamp) ---
 BASE_SAVE_DIR = "saved_models"
 BASE_LOG_DIR = "runs"
-MODEL_NAME_BASE = "kvasir_custom_unet_bce_dice_bs8" # Updated model name
+MODEL_NAME_BASE = "kvasir_custom_unet_bce_dice_bs32" # Updated model name
 
 # --- train_one_epoch function ---
 def train_one_epoch(loader, model, optimizer, bce_loss_fn, dice_loss_fn, loss_alpha, loss_beta, scaler, writer, epoch): # Added loss_alpha, loss_beta
@@ -153,6 +153,8 @@ def main():
     SAVE_DIR = os.path.join("saved_models", run_name) # Assuming BASE_SAVE_DIR is "saved_models"
     MODEL_FILENAME = f"{run_name}_best.pth.tar"
     MODEL_PATH = os.path.join(SAVE_DIR, MODEL_FILENAME)
+    early_stopping_patience = 20
+    epochs_no_improvement = 0
 
     os.makedirs(SAVE_DIR, exist_ok=True)
     os.makedirs(TENSORBOARD_LOG_DIR, exist_ok=True)
@@ -171,7 +173,12 @@ def main():
     
     # Learning Rate Scheduler (from previous step)
     scheduler = ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.1, patience=5, verbose=True
+        optimizer,
+        mode='max',
+        factor=0.5,  # Gentler reduction
+        patience=5,   # Keep patience or slightly increase if factor is less aggressive
+        verbose=True,
+        min_lr=1e-6  # Stop LR from going too low
     )
 
     # ... (DataLoaders, GradScaler, TensorBoard Writer, LOAD_MODEL logic as before) ...
@@ -225,6 +232,14 @@ def main():
                 'optimal_threshold': optimal_threshold
             }
             save_checkpoint(checkpoint_data, filename=MODEL_PATH)
+            epochs_no_improvement = 0
+        else:
+            epochs_no_improvement += 1
+            print(f"No improvement in validation IoU for {epochs_no_improvement} epochs.")
+        
+        if epochs_no_improvement >= early_stopping_patience:
+            print(f"Early stopping triggered after {early_stopping_patience} epochs without improvement.")
+            break
 
         # ... (log images to TensorBoard as before) ...
         if epoch % 10 == 0 or epoch == NUM_EPOCHS - 1:

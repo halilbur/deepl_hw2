@@ -3,97 +3,23 @@ from tqdm import tqdm
 import os
 import numpy as np
 import pandas as pd
-import torchvision.utils # <<< Import torchvision.utils
-import matplotlib.pyplot as plt # <<< Add matplotlib import
-import seaborn as sns # <<< Add seaborn import
-from PIL import Image, ImageDraw, ImageFont # <<< Add PIL imports
-import random # <<< Add random import
-
 from model import CustomUNet
 from dataset import get_loaders
-from utils import load_checkpoint, calculate_metrics
+from utils import load_checkpoint, calculate_metrics, save_evaluation_images, save_confusion_matrix_image
+import torchvision.transforms as transforms
 
 # --- Ayarlar ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 16 # Testte batch size artırılabilir
 NUM_WORKERS = 0
 PIN_MEMORY = True
-# <<< CHANGE THESE PATHS based on the output of train.py >>>
-RUN_NAME = "kvasir_custom_unet_bce_dice_bs8_20250513_215050" # <<< Example: kvasir_unet_resnet34_20250504_153000
+RUN_NAME = "kvasir_unet_resnet34_20250504_044229" 
 MODEL_PATH = os.path.join("saved_models", RUN_NAME, f"{RUN_NAME}_best.pth.tar")
 RESULTS_PATH = os.path.join("test_results", RUN_NAME)
-
-# <<< Add this line: Set the optimal threshold found during training >>>
-OPTIMAL_THRESHOLD = 0.5 # <<< CHANGE THIS based on train.py output
-DEFAULT_OPTIMAL_THRESHOLD = 0.5 # <<< Add this line as a fallback
-
-# <<< Add settings for saving images >>>
-SAVE_IMAGES = True # Set to False to disable image saving
-NUM_IMAGES_TO_SAVE = 4 # How many sample images to save
-
-# --- Utility functions (ensure these are defined or imported from utils.py) ---
-def denormalize(tensor, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
-    # Assuming tensor is (C, H, W) or (N, C, H, W)
-    # This is a common ImageNet denormalization
-    if tensor.ndim == 3:
-        for t, m, s in zip(tensor, mean, std):
-            t.mul_(s).add_(m)
-    elif tensor.ndim == 4:
-        for i in range(tensor.size(0)):
-            for t, m, s in zip(tensor[i], mean, std):
-                t.mul_(s).add_(m)
-    return torch.clamp(tensor, 0, 1)
-
-
-def save_confusion_matrix_image(cm, path, filename="confusion_matrix.png", class_names=None):
-    if class_names is None:
-        class_names = ['Background', 'Polyp'] # For binary case
-    
-    df_cm = pd.DataFrame(cm, index=class_names, columns=class_names)
-    plt.figure(figsize=(8, 6))
-    try:
-        sns.heatmap(df_cm, annot=True, fmt="d", cmap="Blues") # fmt="d" for integer counts
-        plt.title("Confusion Matrix")
-        plt.ylabel("Actual")
-        plt.xlabel("Predicted")
-        plt.savefig(os.path.join(path, filename))
-        plt.close()
-        print(f"Confusion matrix saved to {os.path.join(path, filename)}")
-    except Exception as e:
-        print(f"Could not save confusion matrix: {e}")
-
-def save_evaluation_images(original_img_tensor, pred_mask_tensor, target_mask_tensor, img_idx, results_dir):
-    """Saves original, predicted mask, and target mask for a single sample."""
-    original_pil = torchvision.transforms.ToPILImage()(denormalize(original_img_tensor.cpu())[0])
-    pred_pil = torchvision.transforms.ToPILImage()(pred_mask_tensor[0].float().cpu()) # Ensure mask is float (0 or 1)
-    target_pil = torchvision.transforms.ToPILImage()(target_mask_tensor[0].float().cpu())
-
-
-
-    # Create a combined image
-    width, height = original_pil.size
-    combined_img = Image.new('RGB', (width * 3, height + 30)) # +30 for titles
-    
-    # Add titles
-    try:
-        font = ImageFont.truetype("arial.ttf", 15) # Adjust font if needed
-    except IOError:
-        font = ImageFont.load_default()
-    draw = ImageDraw.Draw(combined_img)
-    draw.text((10, 5), "Original Image", fill="white", font=font)
-    draw.text((width + 10, 5), "Predicted Mask", fill="white", font=font)
-    draw.text((width * 2 + 10, 5), "Target Mask", fill="white", font=font)
-
-    combined_img.paste(original_pil, (0, 30))
-    combined_img.paste(pred_pil.convert('RGB'), (width, 30)) # Convert mask to RGB for pasting
-    combined_img.paste(target_pil.convert('RGB'), (width * 2, 30))
-    
-    combined_filename = f"eval_sample_{img_idx}.png"
-    if not os.path.exists(results_dir):
-        os.makedirs(results_dir)
-        print(f"Created results directory: {results_dir}")
-    combined_img.save(os.path.join(results_dir, combined_filename))
-
+OPTIMAL_THRESHOLD = 0.5 
+DEFAULT_OPTIMAL_THRESHOLD = 0.5 
+SAVE_IMAGES = True 
+NUM_IMAGES_TO_SAVE = 4 
 
 # --- Main Evaluation Function ---
 def evaluate(model, loader, threshold, results_dir):
@@ -151,6 +77,18 @@ def evaluate(model, loader, threshold, results_dir):
 
     metrics = calculate_metrics(torch.from_numpy(all_preds_np), torch.from_numpy(all_targets_np)) # Expects tensors
     
+    # Calculate F1 score
+    if 'precision' in metrics and 'recall' in metrics:
+        precision = metrics['precision']
+        recall = metrics['recall']
+        if (precision + recall) > 0: # Avoid division by zero
+            metrics['f1_score'] = 2 * (precision * recall) / (precision + recall)
+        else:
+            metrics['f1_score'] = 0.0 # F1 is 0 if precision and recall are both 0
+    else:
+        metrics['f1_score'] = float('nan') # Indicate F1 couldn't be calculated
+        print("Warning: Precision and/or Recall not found in metrics. F1 Score set to NaN.")
+
     # Generate and save confusion matrix
     try:
         from sklearn.metrics import confusion_matrix as sk_confusion_matrix
@@ -230,6 +168,11 @@ def main():
     if 'precision' in test_metrics: print(f"  Precision: {test_metrics['precision']:.4f}")
     if 'recall' in test_metrics: print(f"  Recall (Sensitivity): {test_metrics['recall']:.4f}")
     if 'specificity' in test_metrics: print(f"  Specificity: {test_metrics['specificity']:.4f}")
+    if 'f1_score' in test_metrics:
+        if isinstance(test_metrics['f1_score'], float) and not np.isnan(test_metrics['f1_score']):
+            print(f"  F1 Score: {test_metrics['f1_score']:.4f}")
+        else:
+            print(f"  F1 Score: {test_metrics['f1_score']}") # Handles NaN or other non-float representations
 
     # Save metrics to a CSV file
     metrics_df = pd.DataFrame([test_metrics])
